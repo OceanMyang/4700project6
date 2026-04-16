@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, DNSLabel
 
 class Server:
     def __init__(self, root_ip, zone, port):
@@ -24,6 +24,7 @@ class Server:
                 self.domain = record.rname
         self.log("Domain name: %s" % self.domain)
 
+
     def log(self, message):
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
@@ -39,10 +40,12 @@ class Server:
         request = DNSRecord.parse(data)
         self.log("Received message:\n%s" % request)
 
-        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
-        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
         response = request.reply()
-        response.add_answer(RR("abc.com", QTYPE.A, rdata=A("1.2.3.4"), ttl=60))       
+        for q in request.questions:
+            if q.qname.matchSuffix(self.domain):
+                for record in self.records:
+                    if record.rname == q.qname:
+                        response.add_answer(record)
         
         self.send(addr, response)
 
