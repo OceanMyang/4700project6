@@ -61,22 +61,32 @@ class Server:
                     glues.extend(self.resolve_local(record.rdata.label))
         return matches
 
-    def forward(self, ip, qname, qtype, addr, original):
+    def forward(self, ip, qname, qtype, addr, original, accumulated=None):
         request = DNSRecord.question(qname, QTYPE[qtype])
-        self.pending[request.header.id] = (addr, original, qname, qtype)
+        self.pending[request.header.id] = (addr, original, qname, qtype, accumulated or [])
         self.udp_socket.sendto(request.pack(), (ip, 53))
 
     def resolve_global(self, response):
         if response.header.id not in self.pending:
             return
         
-        addr, original, qname, qtype = self.pending.pop(response.header.id)
+        addr, original, qname, qtype, accumulated = self.pending.pop(response.header.id)
 
         # final answer: has answer records OR authoritative auth records
         if len(response.rr) > 0 or (len(response.auth) > 0 and response.header.aa):
+            
+            # check if answer is an unresolved CNAME
+            if len(response.rr) == 1 and response.rr[0].rtype == QTYPE.CNAME and qtype == QTYPE.A:
+                accumulated.append(response.rr[0])
+                cname_target = response.rr[0].rdata.label
+                self.forward(self.root_ip, cname_target, qtype, addr, original, accumulated)
+                return
+
             reply = original.reply()
             reply.header.aa = False
             reply.header.ra = 1
+            for rr in accumulated:
+                reply.add_answer(rr)
             for rr in response.rr:
                 reply.add_answer(rr)
             for rr in response.auth:
@@ -98,7 +108,7 @@ class Server:
                         break
 
         if next_ip:
-            self.forward(next_ip, qname, qtype, addr, original)
+            self.forward(next_ip, qname, qtype, addr, original, accumulated)
         else:
             reply = original.reply()
             reply.header.rcode = RCODE.NXDOMAIN
