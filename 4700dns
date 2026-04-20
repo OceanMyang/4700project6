@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE
 
 class Server:
     def __init__(self, root_ip, zone, port):
@@ -32,16 +32,24 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
+    
+    def compare_types(self, type1, type2):
+        if type1 in [QTYPE.A, QTYPE.CNAME]:
+            return type2 in [QTYPE.A, QTYPE.CNAME]
+        else:
+            return type1 == type2
 
-    def find_records(self, qname, qtype = None):
+    def find_records(self, qname, qtype = None, glues = None):
         matches = []
         for record in self.records:
             if record.rname == qname:
-                if qtype in [QTYPE.MX] and record.rtype != qtype:
+                if qtype and not self.compare_types(qtype, record.rtype):
                     continue
                 matches.append(record)
                 if record.rtype == QTYPE.CNAME:
                     matches.extend(self.find_records(record.rdata.label))
+                if record.rtype == QTYPE.NS and glues != None:
+                    glues.extend(self.find_records(record.rdata.label))
                 
         return matches
 
@@ -55,9 +63,14 @@ class Server:
         response = request.reply()
         for q in request.questions:
             if q.qname.matchSuffix(self.domain):
-                matches = self.find_records(q.qname, q.qtype)
+                glues = []
+                matches = self.find_records(q.qname, q.qtype, glues)
+                if not matches:
+                    response.header.rcode = RCODE.NXDOMAIN
                 for record in matches:
                     response.add_answer(record)
+                for record in glues:
+                    response.add_ar(record)
 
         
         self.send(addr, response)
