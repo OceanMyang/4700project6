@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, DNSLabel
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A
 
 class Server:
     def __init__(self, root_ip, zone, port):
@@ -33,6 +33,18 @@ class Server:
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
 
+    def find_records(self, qname, qtype = None):
+        matches = []
+        for record in self.records:
+            if record.rname == qname:
+                if qtype in [QTYPE.MX] and record.rtype != qtype:
+                    continue
+                matches.append(record)
+                if record.rtype == QTYPE.CNAME:
+                    matches.extend(self.find_records(record.rdata.label))
+                
+        return matches
+
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
 
@@ -43,9 +55,10 @@ class Server:
         response = request.reply()
         for q in request.questions:
             if q.qname.matchSuffix(self.domain):
-                for record in self.records:
-                    if record.rname == q.qname:
-                        response.add_answer(record)
+                matches = self.find_records(q.qname, q.qtype)
+                for record in matches:
+                    response.add_answer(record)
+
         
         self.send(addr, response)
 
