@@ -48,7 +48,7 @@ class Server:
         else:
             return type1 == type2
 
-    def resolve_local(self, qname, qtype=None, glues=None):
+    def find_local_records(self, qname, qtype=None, glues=None):
         matches = []
         for record in self.records:
             if record.rname == qname:
@@ -56,15 +56,31 @@ class Server:
                     continue
                 matches.append(record)
                 if record.rtype == QTYPE.CNAME:
-                    matches.extend(self.resolve_local(record.rdata.label))
+                    matches.extend(self.find_local_records(record.rdata.label))
                 if record.rtype == QTYPE.NS and glues is not None:
-                    glues.extend(self.resolve_local(record.rdata.label))
+                    glues.extend(self.find_local_records(record.rdata.label))
         return matches
 
     def forward(self, ip, qname, qtype, addr, original, accumulated=None):
         request = DNSRecord.question(qname, QTYPE[qtype])
         self.pending[request.header.id] = (addr, original, qname, qtype, accumulated or [])
         self.udp_socket.sendto(request.pack(), (ip, 53))
+
+    def find_next_ip(self, response):
+        next_ip = None
+        for rr in response.ar:
+            if rr.rtype == QTYPE.A:
+                next_ip = str(rr.rdata)
+                break
+
+        if not next_ip:
+            for rr in response.auth:
+                if rr.rtype == QTYPE.NS:
+                    ns_ip_records = self.find_local_records(str(rr.rdata.label))
+                    if ns_ip_records:
+                        next_ip = str(ns_ip_records[0].rdata)
+                        break
+        return next_ip
 
     def resolve_global(self, response):
         if response.header.id not in self.pending:
@@ -96,16 +112,7 @@ class Server:
             self.send(addr, reply)
             return
 
-        # referral: follow it
-        next_ip = next((str(rr.rdata) for rr in response.ar if rr.rtype == QTYPE.A), None)
-
-        if not next_ip:
-            for rr in response.auth:
-                if rr.rtype == QTYPE.NS:
-                    ns_ip_records = self.resolve_local(str(rr.rdata.label))
-                    if ns_ip_records:
-                        next_ip = str(ns_ip_records[0].rdata)
-                        break
+        next_ip = self.find_next_ip(response)
 
         if next_ip:
             self.forward(next_ip, qname, qtype, addr, original, accumulated)
@@ -122,11 +129,11 @@ class Server:
                 if conn is self.socket:
                     request, addr = self.recv(conn)
                     
-                    response = request.reply()
                     for q in request.questions:
                         if q.qname.matchSuffix(self.domain):
+                            response = request.reply()
                             glues = []
-                            matches = self.resolve_local(q.qname, q.qtype, glues)
+                            matches = self.find_local_records(q.qname, q.qtype, glues)
                             if matches:
                                 for record in matches:
                                     response.add_answer(record)
