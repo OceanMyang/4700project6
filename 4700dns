@@ -11,6 +11,9 @@ class Server:
         self.socket.bind(("0.0.0.0", port))
         self.port = self.socket.getsockname()[1]
 
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.pending = {}
+
         self.log("Bound to port %d" % self.port)
 
         with open(zone, "r") as f:
@@ -32,14 +35,20 @@ class Server:
     def send(self, addr, message):
         self.log("Sending message:\n%s" % message)
         self.socket.sendto(message.pack(), addr)
-    
+
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+        record = DNSRecord.parse(data)
+        self.log("Received message:\n%s" % record)
+        return record, addr
+
     def compare_types(self, type1, type2):
         if type1 in [QTYPE.A, QTYPE.CNAME]:
             return type2 in [QTYPE.A, QTYPE.CNAME]
         else:
             return type1 == type2
 
-    def find_records(self, qname, qtype = None, glues = None):
+    def resolve_local(self, qname, qtype=None, glues=None):
         matches = []
         for record in self.records:
             if record.rname == qname:
@@ -47,41 +56,81 @@ class Server:
                     continue
                 matches.append(record)
                 if record.rtype == QTYPE.CNAME:
-                    matches.extend(self.find_records(record.rdata.label))
-                if record.rtype == QTYPE.NS and glues != None:
-                    glues.extend(self.find_records(record.rdata.label))
-                
+                    matches.extend(self.resolve_local(record.rdata.label))
+                if record.rtype == QTYPE.NS and glues is not None:
+                    glues.extend(self.resolve_local(record.rdata.label))
         return matches
 
-    def recv(self, socket):
-        data, addr = socket.recvfrom(65535)
+    def forward(self, ip, qname, qtype, addr, original):
+        request = DNSRecord.question(qname, QTYPE[qtype])
+        self.pending[request.header.id] = (addr, original, qname, qtype)
+        self.udp_socket.sendto(request.pack(), (ip, 53))
 
-        # Unpack the DNS request
-        request = DNSRecord.parse(data)
-        self.log("Received message:\n%s" % request)
-
-        response = request.reply()
-        for q in request.questions:
-            if q.qname.matchSuffix(self.domain):
-                glues = []
-                matches = self.find_records(q.qname, q.qtype, glues)
-                if not matches:
-                    response.header.rcode = RCODE.NXDOMAIN
-                for record in matches:
-                    response.add_answer(record)
-                for record in glues:
-                    response.add_ar(record)
-
+    def resolve_global(self, response):
+        if response.header.id not in self.pending:
+            return
         
-        self.send(addr, response)
+        addr, original, qname, qtype = self.pending.pop(response.header.id)
+
+        # final answer: has answer records OR authoritative auth records
+        if len(response.rr) > 0 or (len(response.auth) > 0 and response.header.aa):
+            reply = original.reply()
+            reply.header.aa = False
+            reply.header.ra = 1
+            for rr in response.rr:
+                reply.add_answer(rr)
+            for rr in response.auth:
+                reply.add_auth(rr)
+            for rr in response.ar:
+                reply.add_ar(rr)
+            self.send(addr, reply)
+            return
+
+        # referral: follow it
+        next_ip = next((str(rr.rdata) for rr in response.ar if rr.rtype == QTYPE.A), None)
+
+        if not next_ip:
+            for rr in response.auth:
+                if rr.rtype == QTYPE.NS:
+                    ns_ip_records = self.resolve_local(str(rr.rdata.label))
+                    if ns_ip_records:
+                        next_ip = str(ns_ip_records[0].rdata)
+                        break
+
+        if next_ip:
+            self.forward(next_ip, qname, qtype, addr, original)
+        else:
+            reply = original.reply()
+            reply.header.rcode = RCODE.NXDOMAIN
+            self.send(addr, reply)
 
     def run(self):
         seq = 0
         while True:
-            socks = select.select([self.socket], [], [], 0.1)[0]
+            socks = select.select([self.socket, self.udp_socket], [], [], 0.1)[0]
             for conn in socks:
-                self.recv(conn)
+                if conn is self.socket:
+                    request, addr = self.recv(conn)
+                    
+                    response = request.reply()
+                    for q in request.questions:
+                        if q.qname.matchSuffix(self.domain):
+                            glues = []
+                            matches = self.resolve_local(q.qname, q.qtype, glues)
+                            if matches:
+                                for record in matches:
+                                    response.add_answer(record)
+                                for record in glues:
+                                    response.add_ar(record)
+                            else:
+                                response.header.rcode = RCODE.NXDOMAIN
+                            self.send(addr, response)
+                        else:
+                            self.forward(self.root_ip, q.qname, q.qtype, addr, request)
 
+                elif conn is self.udp_socket:
+                    dns_response, _ = self.recv(conn)
+                    self.resolve_global(dns_response)
         return
 
 if __name__ == "__main__":
