@@ -18,15 +18,17 @@ class Server:
 
         with open(zone, "r") as f:
             zone_data = f.read()
-        
-        self.records = RR.fromZone(zone_data)
-        self.log("Auth zone records:")
-        for record in self.records:
+
+        self.records = {}
+        for record in RR.fromZone(zone_data):
             self.log(str(record))
             if QTYPE[record.rtype] == "SOA":
                 self.domain = record.rname
+            key = str(record.rname)
+            if key not in self.records:
+                self.records[key] = []
+            self.records[key].append(record)
         self.log("Domain name: %s" % self.domain)
-
 
     def log(self, message):
         sys.stderr.write(message + "\n")
@@ -50,15 +52,15 @@ class Server:
 
     def find_local_records(self, qname, qtype=None, glues=None):
         matches = []
-        for record in self.records:
-            if record.rname == qname:
-                if qtype and not self.compare_types(qtype, record.rtype):
-                    continue
-                matches.append(record)
-                if record.rtype == QTYPE.CNAME:
-                    matches.extend(self.find_local_records(record.rdata.label))
-                if record.rtype == QTYPE.NS and glues is not None:
-                    glues.extend(self.find_local_records(record.rdata.label))
+        key = str(qname)
+        for record in self.records.get(key, []):
+            if qtype and not self.compare_types(qtype, record.rtype):
+                continue
+            matches.append(record)
+            if record.rtype == QTYPE.CNAME:
+                matches.extend(self.find_local_records(record.rdata.label))
+            if record.rtype == QTYPE.NS and glues is not None:
+                glues.extend(self.find_local_records(record.rdata.label))
         return matches
 
     def forward(self, ip, qname, qtype, addr, original, accumulated=None):
@@ -101,14 +103,14 @@ class Server:
             reply = original.reply()
             reply.header.aa = False
             reply.header.ra = 1
-            for rr in accumulated:
-                reply.add_answer(rr)
-            for rr in response.rr:
-                reply.add_answer(rr)
-            for rr in response.auth:
-                reply.add_auth(rr)
-            for rr in response.ar:
-                reply.add_ar(rr)
+            for record in accumulated:
+                reply.add_answer(record)
+            for record in response.rr:
+                reply.add_answer(record)
+            for record in response.auth:
+                reply.add_auth(record)
+            for record in response.ar:
+                reply.add_ar(record)
             self.send(addr, reply)
             return
 
