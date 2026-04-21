@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
-from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, RCODE, DNSLabel
 
 class Server:
     def __init__(self, root_ip, zone, port):
@@ -63,9 +63,10 @@ class Server:
                 glues.extend(self.find_local_records(record.rdata.label))
         return matches
 
-    def forward(self, ip, qname, qtype, addr, original, cnames=None):
+    def forward(self, ip, qname, qtype, addr, original, cnames=None, bailiwick=None):
         request = DNSRecord.question(qname, QTYPE[qtype])
-        self.pending[request.header.id] = (addr, original, qname, qtype, cnames or [])
+        bailiwick = bailiwick or DNSLabel(".")  # root: allow everything
+        self.pending[request.header.id] = (addr, original, qname, qtype, cnames or [], bailiwick)
         self.udp_socket.sendto(request.pack(), (ip, 53))
 
     def find_next_ip(self, response):
@@ -88,7 +89,14 @@ class Server:
         if response.header.id not in self.pending:
             return
         
-        addr, original, qname, qtype, cnames = self.pending.pop(response.header.id)
+        addr, original, qname, qtype, cnames, bailiwick = self.pending.pop(response.header.id)
+
+        # Bailiwick check — drop records outside the current zone
+        # Empty bailiwick label = root, everything is allowed
+        if bailiwick.label:
+            response.rr   = [rr for rr in response.rr   if rr.rname.matchSuffix(bailiwick)]
+            response.auth = [rr for rr in response.auth  if rr.rname.matchSuffix(bailiwick)]
+            response.ar   = [rr for rr in response.ar    if rr.rname.matchSuffix(bailiwick)]
 
         # final answer: has answer records OR authoritative auth records
         if len(response.rr) > 0 or response.header.aa:
@@ -117,7 +125,13 @@ class Server:
         next_ip = self.find_next_ip(response)
 
         if next_ip:
-            self.forward(next_ip, qname, qtype, addr, original, cnames)
+            # Narrow bailiwick to the zone from the auth NS records
+            new_bailiwick = bailiwick
+            for rr in response.auth:
+                if rr.rtype == QTYPE.NS:
+                    new_bailiwick = rr.rname  # e.g. DNSLabel('google.com.')
+                    break
+            self.forward(next_ip, qname, qtype, addr, original, cnames, new_bailiwick)
         else:
             reply = original.reply()
             reply.header.aa = False
