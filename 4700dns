@@ -63,9 +63,9 @@ class Server:
                 glues.extend(self.find_local_records(record.rdata.label))
         return matches
 
-    def forward(self, ip, qname, qtype, addr, original, accumulated=None):
+    def forward(self, ip, qname, qtype, addr, original, cnames=None):
         request = DNSRecord.question(qname, QTYPE[qtype])
-        self.pending[request.header.id] = (addr, original, qname, qtype, accumulated or [])
+        self.pending[request.header.id] = (addr, original, qname, qtype, cnames or [])
         self.udp_socket.sendto(request.pack(), (ip, 53))
 
     def find_next_ip(self, response):
@@ -88,22 +88,22 @@ class Server:
         if response.header.id not in self.pending:
             return
         
-        addr, original, qname, qtype, accumulated = self.pending.pop(response.header.id)
+        addr, original, qname, qtype, cnames = self.pending.pop(response.header.id)
 
         # final answer: has answer records OR authoritative auth records
-        if len(response.rr) > 0 or (len(response.auth) > 0 and response.header.aa):
+        if len(response.rr) > 0 or response.header.aa:
             
             # check if answer is an unresolved CNAME
             if len(response.rr) == 1 and response.rr[0].rtype == QTYPE.CNAME and qtype == QTYPE.A:
-                accumulated.append(response.rr[0])
+                cnames.append(response.rr[0])
                 cname_target = response.rr[0].rdata.label
-                self.forward(self.root_ip, cname_target, qtype, addr, original, accumulated)
+                self.forward(self.root_ip, cname_target, qtype, addr, original, cnames)
                 return
 
             reply = original.reply()
             reply.header.aa = False
             reply.header.ra = 1
-            for record in accumulated:
+            for record in cnames:
                 reply.add_answer(record)
             for record in response.rr:
                 reply.add_answer(record)
@@ -117,7 +117,7 @@ class Server:
         next_ip = self.find_next_ip(response)
 
         if next_ip:
-            self.forward(next_ip, qname, qtype, addr, original, accumulated)
+            self.forward(next_ip, qname, qtype, addr, original, cnames)
         else:
             reply = original.reply()
             reply.header.rcode = RCODE.NXDOMAIN
