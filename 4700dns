@@ -20,14 +20,14 @@ class Server:
             zone_data = f.read()
 
         self.records = {}
-        for record in RR.fromZone(zone_data):
-            self.log(str(record))
-            if QTYPE[record.rtype] == "SOA":
-                self.domain = record.rname
-            key = str(record.rname)
+        for rr in RR.fromZone(zone_data):
+            self.log(str(rr))
+            if QTYPE[rr.rtype] == "SOA":
+                self.domain = rr.rname
+            key = str(rr.rname)
             if key not in self.records:
                 self.records[key] = []
-            self.records[key].append(record)
+            self.records[key].append(rr)
         self.log("Domain name: %s" % self.domain)
 
     def log(self, message):
@@ -53,14 +53,14 @@ class Server:
     def find_local_records(self, qname, qtype=None, glues=None):
         matches = []
         key = str(qname)
-        for record in self.records.get(key, []):
-            if qtype and not self.compare_types(qtype, record.rtype):
+        for rr in self.records.get(key, []):
+            if qtype and not self.compare_types(qtype, rr.rtype):
                 continue
-            matches.append(record)
-            if record.rtype == QTYPE.CNAME:
-                matches.extend(self.find_local_records(record.rdata.label))
-            if record.rtype == QTYPE.NS and glues is not None:
-                glues.extend(self.find_local_records(record.rdata.label))
+            matches.append(rr)
+            if rr.rtype == QTYPE.CNAME:
+                matches.extend(self.find_local_records(rr.rdata.label))
+            if rr.rtype == QTYPE.NS and glues is not None:
+                glues.extend(self.find_local_records(rr.rdata.label))
         return matches
 
     def forward(self, ip, qname, qtype, addr, original, cnames=None, bailiwick=None):
@@ -85,58 +85,20 @@ class Server:
                         break
         return next_ip
 
-    def resolve_global(self, response):
-        if response.header.id not in self.pending:
-            return
-        
-        addr, original, qname, qtype, cnames, bailiwick = self.pending.pop(response.header.id)
-
-        # Bailiwick check — drop records outside the current zone
-        # Empty bailiwick label = root, everything is allowed
-        if bailiwick.label:
-            response.rr   = [rr for rr in response.rr   if rr.rname.matchSuffix(bailiwick)]
-            response.auth = [rr for rr in response.auth  if rr.rname.matchSuffix(bailiwick)]
-            response.ar   = [rr for rr in response.ar    if rr.rname.matchSuffix(bailiwick)]
-
-        # final answer: has answer records OR authoritative auth records
-        if len(response.rr) > 0 or response.header.aa:
-            
-            # check if answer is an unresolved CNAME
-            if len(response.rr) == 1 and response.rr[0].rtype == QTYPE.CNAME and qtype == QTYPE.A:
-                cnames.append(response.rr[0])
-                cname_target = response.rr[0].rdata.label
-                self.forward(self.root_ip, cname_target, qtype, addr, original, cnames)
-                return
-
-            reply = original.reply()
-            reply.header.aa = False
-            reply.header.ra = 1
-            for record in cnames:
-                reply.add_answer(record)
-            for record in response.rr:
-                reply.add_answer(record)
-            for record in response.auth:
-                reply.add_auth(record)
-            for record in response.ar:
-                reply.add_ar(record)
-            self.send(addr, reply)
-            return
-
-        next_ip = self.find_next_ip(response)
-
-        if next_ip:
-            # Narrow bailiwick to the zone from the auth NS records
-            new_bailiwick = bailiwick
+    def transfer_reply(self, addr, request, response = None, cnames = []):
+        reply = request.reply()
+        reply.header.aa = False
+        reply.header.ra = 1
+        for rr in cnames:
+            reply.add_answer(rr)
+        if response:
+            for rr in response.rr:
+                reply.add_answer(rr)
             for rr in response.auth:
-                if rr.rtype == QTYPE.NS:
-                    new_bailiwick = rr.rname  # e.g. DNSLabel('google.com.')
-                    break
-            self.forward(next_ip, qname, qtype, addr, original, cnames, new_bailiwick)
-        else:
-            reply = original.reply()
-            reply.header.aa = False
-            reply.header.ra = 1
-            self.send(addr, reply)
+                reply.add_auth(rr)
+            for rr in response.ar:
+                reply.add_ar(rr)
+        self.send(addr, reply)
 
     def run(self):
         seq = 0
@@ -152,10 +114,10 @@ class Server:
                             glues = []
                             matches = self.find_local_records(q.qname, q.qtype, glues)
                             if matches:
-                                for record in matches:
-                                    response.add_answer(record)
-                                for record in glues:
-                                    response.add_ar(record)
+                                for rr in matches:
+                                    response.add_answer(rr)
+                                for rr in glues:
+                                    response.add_ar(rr)
                             else:
                                 response.header.rcode = RCODE.NXDOMAIN
                             self.send(addr, response)
@@ -163,8 +125,45 @@ class Server:
                             self.forward(self.root_ip, q.qname, q.qtype, addr, request)
 
                 elif conn is self.udp_socket:
-                    dns_response, _ = self.recv(conn)
-                    self.resolve_global(dns_response)
+                    response, _ = self.recv(conn)
+
+                    if response.header.id not in self.pending:
+                        continue
+                    
+                    addr, original, qname, qtype, cnames, bailiwick = self.pending.pop(response.header.id)
+
+                    # Bailiwick check — drop records outside the current zone
+                    # Empty bailiwick label = root, everything is allowed
+                    if bailiwick.label:
+                        response.rr   = [rr for rr in response.rr   if rr.rname.matchSuffix(bailiwick)]
+                        response.auth = [rr for rr in response.auth  if rr.rname.matchSuffix(bailiwick)]
+                        response.ar   = [rr for rr in response.ar    if rr.rname.matchSuffix(bailiwick)]
+
+                    # final answer: has answer records OR authoritative auth records
+                    if len(response.rr) > 0 or response.header.aa:
+                        
+                        # check if answer is an unresolved CNAME
+                        if len(response.rr) == 1 and response.rr[0].rtype == QTYPE.CNAME and qtype == QTYPE.A:
+                            cnames.append(response.rr[0])
+                            cname_target = response.rr[0].rdata.label
+                            self.forward(self.root_ip, cname_target, qtype, addr, original, cnames)
+                            continue
+
+                        self.transfer_reply(addr, original, response, cnames)
+                        continue
+
+                    next_ip = self.find_next_ip(response)
+
+                    if next_ip:
+                        # Narrow bailiwick to the zone from the auth NS records
+                        new_bailiwick = bailiwick
+                        for rr in response.auth:
+                            if rr.rtype == QTYPE.NS:
+                                new_bailiwick = rr.rname  # e.g. DNSLabel('google.com.')
+                                break
+                        self.forward(next_ip, qname, qtype, addr, original, cnames, new_bailiwick)
+                    else:
+                        self.transfer_reply(addr, original)
         return
 
 if __name__ == "__main__":
