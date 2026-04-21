@@ -120,7 +120,8 @@ class Server:
             self.forward(next_ip, qname, qtype, addr, original, cnames)
         else:
             reply = original.reply()
-            reply.header.rcode = RCODE.NXDOMAIN
+            reply.header.aa = False
+            reply.header.ra = 1
             self.send(addr, reply)
 
     def run(self):
